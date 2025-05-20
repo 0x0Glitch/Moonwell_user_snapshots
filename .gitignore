@@ -1,0 +1,34 @@
+# Environment variables and local config
+.env
+*.env
+*.env.local
+
+# Checkpoint files (containing progress data)
+data/checkpoint.txt
+
+# Build artifacts
+/build
+/dist
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Dependency directories
+/vendor/
+/node_modules/
+
+# Go specific
+*.test
+*.out
