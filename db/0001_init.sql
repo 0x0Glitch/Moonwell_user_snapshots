@@ -19,5 +19,6 @@ CREATE TABLE IF NOT EXISTS user_balances (
     "LBTC" NUMERIC[] DEFAULT '{}'::NUMERIC[],
     "VIRTUAL" NUMERIC[] DEFAULT '{}'::NUMERIC[],
     "MORPHO" NUMERIC[] DEFAULT '{}'::NUMERIC[],
+    "cbXRP" NUMERIC[] DEFAULT '{}'::NUMERIC[],
     PRIMARY KEY (user_addr)
 );

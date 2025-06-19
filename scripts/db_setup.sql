@@ -36,6 +36,7 @@ ALTER TABLE public.moonwell_user_balances ADD COLUMN "tBTC" NUMERIC[] DEFAULT AR
 ALTER TABLE public.moonwell_user_balances ADD COLUMN "LBTC" NUMERIC[] DEFAULT ARRAY[0, 0];
 ALTER TABLE public.moonwell_user_balances ADD COLUMN "VIRTUAL" NUMERIC[] DEFAULT ARRAY[0, 0];
 ALTER TABLE public.moonwell_user_balances ADD COLUMN "MORPHO" NUMERIC[] DEFAULT ARRAY[0, 0];
+ALTER TABLE public.moonwell_user_balances ADD COLUMN "cbXRP" NUMERIC[] DEFAULT ARRAY[0, 0];
 
 -- Create index for faster queries
 CREATE INDEX idx_user_addr ON public.moonwell_user_balances(user_addr);
