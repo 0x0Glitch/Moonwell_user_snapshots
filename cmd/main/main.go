@@ -1,23 +1,28 @@
 package main
 
 import (
-        "context"
-        "database/sql"
-        "encoding/json"
-        "fmt"
-        "log"
-        "math/big"
-        "os"
-        "regexp"
-        "strconv"
-        "strings"
-        "sync"
-        "time"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
-        "github.com/ethereum/go-ethereum/accounts/abi/bind"
-        "github.com/ethereum/go-ethereum/common"
-        "github.com/ethereum/go-ethereum/ethclient"
-        _ "github.com/lib/pq"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+	_ "github.com/lib/pq"
 )
 
 // Token represents a Moonwell market token
@@ -44,16 +49,19 @@ var (
         snapshotInterval time.Duration
 
         // Rate limiting configuration optimized for 30 req/sec
-        maxConcurrency     = 5                         // Reduced from 10 to 5 workers
-        batchSize          = 100                       // Keep the batch size at 100 for database efficiency
-        subBatchSizes      = []int{20, 20, 20, 20, 20} // Five sub-batches of 20 each
-        fetchIntervalHours = 6
-        useMulticall       = true
-        tokenDelay         = 1300 * time.Millisecond // Increased from 200ms to 1s
-        subBatchDelay      = 1 * time.Second // Longer delay between sub-batches
+        maxConcurrency = 5                         
+        batchSize      = 50                       // Keep the batch size at 100 for database efficiency
+        subBatchSizes  = []int{10, 10, 10, 10, 10} // Five sub-batches of 20 each
+        tokenDelay     = 1000 * time.Millisecond  
+        subBatchDelay  = 1 * time.Second          
 
         // Database connection
         db *sql.DB
+
+        // Logging
+        errorLogger *log.Logger
+        infoLogger  *log.Logger
+        logFile     *os.File
 
         // Context for operations
         rootCtx    context.Context
@@ -66,22 +74,19 @@ var (
         userSnapshots      map[string]map[string]map[string]string
         userSnapshotsMutex sync.Mutex
 
-        // Stats tracking
-        processedTokens int
-        processedUsers  int
+        // Stats tracking - removed unused variables
 
         // Checkpoint variables
         lastProcessedIndex int
         checkpointFile     = "data/checkpoint.txt"
 
-        // Multi3 contract address (for batch calls)
-        multi3 = common.HexToAddress("0xcA11bde05977b3631167028862bE2a173976CA11")
+        // Multi3 contract address removed - not used in current implementation
 
         // SQL queries for user updates
         createActiveUsersSQL = `
                 BEGIN;
 
-DROP table user_metrics.active_users cascade;
+DROP TABLE IF EXISTS user_metrics.active_users CASCADE;
 
 CREATE TABLE user_metrics.active_users AS
 SELECT *
@@ -108,28 +113,76 @@ WHERE
 
    COMMIT;
 
-
         `
         getUserAddressesSQL = `
                 SELECT user_address
                 FROM user_metrics.active_users;
-
-        `
-        truncateBalancesSQL = `
-                TRUNCATE TABLE public.moonwell_user_balances;
         `
 )
 
+func setupLogging() error {
+	// Create logs directory if it doesn't exist
+	logsDir := "logs"
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create logs directory: %w", err)
+	}
+
+	// Create log file with timestamp
+	timestamp := time.Now().Format("2006-01-02_15-04-05")
+	logFileName := filepath.Join(logsDir, fmt.Sprintf("moonwell_snapshot_%s.log", timestamp))
+	
+	var err error
+	logFile, err = os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+
+	// Create multi-writer to write to both file and console
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	
+	// Setup loggers
+	infoLogger = log.New(multiWriter, "[INFO] ", log.LstdFlags|log.Lshortfile)
+	errorLogger = log.New(multiWriter, "[ERROR] ", log.LstdFlags|log.Lshortfile)
+	
+	// Set default logger to use our multi-writer
+	log.SetOutput(multiWriter)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	
+	infoLogger.Printf("Logging initialized - writing to: %s", logFileName)
+	return nil
+}
+
+func logError(format string, args ...interface{}) {
+	if errorLogger != nil {
+		errorLogger.Printf(format, args...)
+	} else {
+		log.Printf("[ERROR] "+format, args...)
+	}
+}
+
+func logInfo(format string, args ...interface{}) {
+	if infoLogger != nil {
+		infoLogger.Printf(format, args...)
+	} else {
+		log.Printf("[INFO] "+format, args...)
+	}
+}
+
 func init() {
-        // Load configuration from environment variables with new names
-        ethRPC = getEnv("RPC_URL", "https://api-BASE.n.dwellir.com/f83cced1-1793-4198-be0c-4e997f8c5c32")
-        pgConnStr = getEnv("PG_DSN", "postgresql://username:password@hostname:port/database")
+	// Setup logging first
+	if err := setupLogging(); err != nil {
+		log.Fatalf("Failed to setup logging: %v", err)
+	}
+	
+	// Load configuration from environment variables with new names
+	ethRPC = getEnv("RPC_URL", "https://api-BASE.n.dwellir.com/f83cced1-1793-4198-be0c-4e997f8c5c32")
+	pgConnStr = getEnv("PG_DSN", "postgresql://username:password@hostname:port/database")
 
         // Parse snapshot interval (convert hours to duration)
         intervalHoursStr := getEnv("FETCH_INTERVAL_HOURS", "2")
         intervalHours, err := strconv.ParseFloat(intervalHoursStr, 64)
         if err != nil {
-                log.Printf("Invalid fetch interval hours: %v, using default 2h", err)
+                logError("Invalid fetch interval hours: %v, using default 2h", err)
                 intervalHours = 2
         }
         snapshotInterval = time.Duration(intervalHours * float64(time.Hour))
@@ -138,21 +191,21 @@ func init() {
         concurrencyStr := getEnv("WORKER_CONCURRENCY", "5")
         concurrency, err := strconv.Atoi(concurrencyStr)
         if err != nil || concurrency < 1 {
-                log.Printf("Invalid worker concurrency: %v, using default 5", err)
+                logError("Invalid worker concurrency: %v, using default 5", err)
                 concurrency = 5
         }
         maxConcurrency = concurrency
 
-        // Set batch size default to 40
-        batchSizeStr := getEnv("BATCH_SIZE", "40")
+        // Set batch size default to 100
+        batchSizeStr := getEnv("BATCH_SIZE", "100")
         batch, err := strconv.Atoi(batchSizeStr)
         if err != nil || batch < 1 {
-                log.Printf("Invalid batch size: %v, using default 40", err)
+                logError("Invalid batch size: %v, using default 40", err)
                 batch = 40
         }
         batchSize = batch
 
-        log.Printf("Configuration: RPC=%s, Concurrency=%d, BatchSize=%d, Interval=%s",
+        logInfo("Configuration: RPC=%s, Concurrency=%d, BatchSize=%d, Interval=%s",
                 ethRPC, maxConcurrency, batchSize, snapshotInterval)
 
         // Initialize snapshots map
@@ -166,6 +219,21 @@ func getEnv(key, defaultValue string) string {
                 return defaultValue
         }
         return value
+}
+
+// isValidTokenSymbol validates token symbol to prevent SQL injection
+func isValidTokenSymbol(symbol string) bool {
+        // Only allow alphanumeric characters, underscores, and hyphens
+        // Tokens should not contain special SQL characters
+        for _, ch := range symbol {
+                if !((ch >= 'a' && ch <= 'z') || 
+                     (ch >= 'A' && ch <= 'Z') || 
+                     (ch >= '0' && ch <= '9') || 
+                     ch == '_' || ch == '-') {
+                        return false
+                }
+        }
+        return len(symbol) > 0 && len(symbol) <= 50
 }
 
 // loadTokens loads token data from a JSON file
@@ -224,6 +292,11 @@ func hasUserActivity(mTokenBalance, borrowBalance *big.Int) bool {
 
 // fetchUserBalance fetches a user's balance for a token using getAccountSnapshot
 func fetchUserBalance(ctx context.Context, token Token, userAddr common.Address) (*Snapshot, error) {
+        // Check if token contract is nil
+        if token.Contract == nil {
+                return nil, fmt.Errorf("token contract is nil for %s", token.Symbol)
+        }
+        
         // Call getAccountSnapshot
         errorCode, mTokenBalance, borrowBalance, _, err := token.Contract.GetAccountSnapshot(&bind.CallOpts{
                 Context: ctx,
@@ -234,8 +307,19 @@ func fetchUserBalance(ctx context.Context, token Token, userAddr common.Address)
         }
 
         // Check error code (0 means no error)
+        if errorCode == nil {
+                return nil, fmt.Errorf("getAccountSnapshot returned nil error code")
+        }
         if errorCode.Cmp(big.NewInt(0)) != 0 {
                 return nil, fmt.Errorf("getAccountSnapshot returned error code: %s", errorCode.String())
+        }
+        
+        // Ensure balance values are not nil
+        if mTokenBalance == nil {
+                mTokenBalance = big.NewInt(0)
+        }
+        if borrowBalance == nil {
+                borrowBalance = big.NewInt(0)
         }
 
         // Create snapshot with only mTokenBalance (index 1) and borrowBalance (index 2)
@@ -256,104 +340,19 @@ func fetchUserBalance(ctx context.Context, token Token, userAddr common.Address)
         return snapshot, nil
 }
 
-// saveSnapshot saves a user's balance to the database
-func saveSnapshot(db *sql.DB, snapshot *Snapshot, tokenSymbol string) error {
-        // Use upsert to ensure one row per user address
-        sqlQuery := fmt.Sprintf(`
-                INSERT INTO public.moonwell_user_balances (user_addr, update_time, "%s")
-                VALUES ($1, $2, ARRAY[$3, $4]::NUMERIC[])
-                ON CONFLICT (user_addr)
-                DO UPDATE SET
-                    update_time = $2,
-                    "%s" = ARRAY[$3, $4]::NUMERIC[]
-        `, tokenSymbol, tokenSymbol)
-
-        // Create a context with timeout for the operation
-        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-        defer cancel()
-
-        // Standardize address format - always use lowercase for storage
-        // This ensures the ON CONFLICT clause works correctly regardless of case
-        userAddr := strings.ToLower(snapshot.User.Hex())
-
-        // Use ExecContext instead of Exec for better context handling
-        _, err := db.ExecContext(ctx,
-                sqlQuery,
-                userAddr,
-                time.Now(),
-                snapshot.MTokenBalance.String(),
-                snapshot.BorrowBalance.String()) // Store borrow balance (index 2) instead of underlying balance
-
-        if err != nil {
-                return fmt.Errorf("error saving snapshot to database: %w", err)
-        }
-
-        return nil
-}
-
-// batchSaveSnapshots saves multiple snapshots to the database in one transaction
-func batchSaveSnapshots(db *sql.DB, snapshots []*Snapshot, tokenSymbol string) error {
-        if len(snapshots) == 0 {
-                return nil
-        }
-
-        // Start a transaction
-        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-        defer cancel()
-
-        tx, err := db.BeginTx(ctx, nil)
-        if err != nil {
-                return fmt.Errorf("failed to begin transaction: %w", err)
-        }
-        defer tx.Rollback() // Rollback if we don't commit
-
-        // Prepare the statement
-        sqlQuery := fmt.Sprintf(`
-                INSERT INTO public.moonwell_user_balances (user_addr, update_time, "%s")
-                VALUES ($1, $2, ARRAY[$3, $4]::NUMERIC[])
-                ON CONFLICT (user_addr)
-                DO UPDATE SET
-                    update_time = $2,
-                    "%s" = ARRAY[$3, $4]::NUMERIC[]
-        `, tokenSymbol, tokenSymbol)
-
-        stmt, err := tx.PrepareContext(ctx, sqlQuery)
-        if err != nil {
-                return fmt.Errorf("failed to prepare statement: %w", err)
-        }
-        defer stmt.Close()
-
-        now := time.Now()
-
-        // Execute for each snapshot
-        for _, snapshot := range snapshots {
-                userAddr := strings.ToLower(snapshot.User.Hex())
-                _, err := stmt.ExecContext(ctx,
-                        userAddr,
-                        now,
-                        snapshot.MTokenBalance.String(),
-                        snapshot.BorrowBalance.String())
-
-                if err != nil {
-                        return fmt.Errorf("error executing batch statement for %s: %w", userAddr, err)
-                }
-        }
-
-        // Commit the transaction
-        if err := tx.Commit(); err != nil {
-                return fmt.Errorf("failed to commit transaction: %w", err)
-        }
-
-        return nil
-}
 
 // addToUserSnapshot adds a token balance to the user's snapshot for printing
-func addToUserSnapshot(snapshot *Snapshot, tokenSymbol string) {
+// Pass timestamp to ensure all users in same batch have identical timestamp
+func addToUserSnapshot(snapshot *Snapshot, tokenSymbol string, timestamp string) {
         userSnapshotsMutex.Lock()
         defer userSnapshotsMutex.Unlock()
 
-        // Get current timestamp as string
-        ts := time.Now().Format(time.RFC3339)
+        // Use provided timestamp to ensure consistency within a batch
+        ts := timestamp
+        if ts == "" {
+                // Fallback if no timestamp provided
+                ts = time.Now().Format(time.RFC3339)
+        }
 
         // Initialize maps if needed
         if userSnapshots[ts] == nil {
@@ -376,15 +375,28 @@ func printUserSnapshots() {
         userSnapshotsMutex.Lock()
         defer userSnapshotsMutex.Unlock()
 
-        // Sort timestamps (not necessary for a single snapshot but good practice)
-        for ts, users := range userSnapshots {
-                fmt.Printf("=== Snapshot at %s ===\n\n", ts)
+        // Get all timestamps and sort them
+        var timestamps []string
+        for ts := range userSnapshots {
+                timestamps = append(timestamps, ts)
+        }
+        sort.Strings(timestamps)
+
+        // Print only the latest snapshot (or all if needed)
+        if len(timestamps) > 0 {
+                // Get the latest timestamp
+                latestTS := timestamps[len(timestamps)-1]
+                users := userSnapshots[latestTS]
+                
+                fmt.Printf("=== Snapshot at %s ===\n\n", latestTS)
 
                 // Print each user's balances
                 for userAddr, tokens := range users {
                         for token, balanceStr := range tokens {
                                 parts := strings.Split(balanceStr, ",")
                                 if len(parts) != 2 {
+                                        log.Printf("Warning: Invalid balance format for user %s, token %s: %s",
+                                                userAddr, token, balanceStr)
                                         continue
                                 }
 
@@ -392,10 +404,17 @@ func printUserSnapshots() {
                                         userAddr, token, parts[0], parts[1])
                         }
                 }
+                
+                // Clear only the printed snapshot, keep others for potential debugging
+                delete(userSnapshots, latestTS)
+                
+                // Clean up old snapshots (keep only last 5 for debugging)
+                if len(timestamps) > 5 {
+                        for i := 0; i < len(timestamps)-5; i++ {
+                                delete(userSnapshots, timestamps[i])
+                        }
+                }
         }
-
-        // Clear snapshots after printing
-        userSnapshots = make(map[string]map[string]map[string]string)
 }
 
 // Snapshot represents user balances for a token
@@ -405,12 +424,55 @@ type BatchSnapshot struct {
         UpdateTime time.Time
 }
 
+// FailedFetch represents a failed RPC call that needs retry
+type FailedFetch struct {
+        User  common.Address
+        Token Token
+        Error error
+}
+
+// fetchUserBalanceWithRetry fetches user balance with retry mechanism
+func fetchUserBalanceWithRetry(ctx context.Context, token Token, userAddr common.Address, maxRetries int) (*Snapshot, error) {
+        var lastErr error
+        
+        for attempt := 0; attempt <= maxRetries; attempt++ {
+                if attempt > 0 {
+                        // Wait 500ms before retry
+                        time.Sleep(500 * time.Millisecond)
+                        logInfo("Retrying user %s, token %s (attempt %d/%d)", userAddr.Hex(), token.Symbol, attempt, maxRetries)
+                }
+                
+                snapshot, err := fetchUserBalance(ctx, token, userAddr)
+                if err == nil {
+                        if attempt > 0 {
+                                logInfo("Retry successful for user %s, token %s", userAddr.Hex(), token.Symbol)
+                        }
+                        return snapshot, nil
+                }
+                
+                lastErr = err
+                logError("Attempt %d failed for user %s, token %s: %v", attempt+1, userAddr.Hex(), token.Symbol, err)
+        }
+        
+        return nil, fmt.Errorf("all retry attempts failed for user %s, token %s: %w", userAddr.Hex(), token.Symbol, lastErr)
+}
+
 // processUserBatch processes a batch of users for all tokens and inserts them into the database
 func processUserBatch(ctx context.Context, tokens []Token, users []common.Address, db *sql.DB) error {
+        if db == nil {
+                return fmt.Errorf("database connection is nil")
+        }
+        if len(users) == 0 || len(tokens) == 0 {
+                return nil // Nothing to process
+        }
+        
+        // Create a consistent timestamp for this batch
+        batchTimestamp := time.Now().Format(time.RFC3339)
+        
         // Create worker pool with semaphore for concurrency control
         var wg sync.WaitGroup
         semaphore := make(chan struct{}, maxConcurrency)
-        errChan := make(chan error, len(users)*len(tokens))
+        failedFetches := make(chan FailedFetch, len(users)*len(tokens))
 
         // Create a mutex for safely updating the batch snapshots
         var dataLock sync.Mutex
@@ -452,25 +514,39 @@ func processUserBatch(ctx context.Context, tokens []Token, users []common.Addres
                                 defer wg.Done()
 
                                 // Acquire semaphore
-                                semaphore <- struct{}{}
-                                defer func() { <-semaphore }()
+                                select {
+                                case semaphore <- struct{}{}:
+                                        defer func() { <-semaphore }()
+                                case <-ctx.Done():
+                                        failedFetches <- FailedFetch{User: u, Token: t, Error: fmt.Errorf("context cancelled")}
+                                        return
+                                }
 
-                                // Fetch user balance
-                                snapshot, err := fetchUserBalance(ctx, t, u)
+                                // Check context before fetching
+                                if ctx.Err() != nil {
+                                        failedFetches <- FailedFetch{User: u, Token: t, Error: fmt.Errorf("context cancelled")}
+                                        return
+                                }
+
+                                // Fetch user balance with retry (3 attempts total)
+                                snapshot, err := fetchUserBalanceWithRetry(ctx, t, u, 2)
                                 if err != nil {
-                                        errChan <- fmt.Errorf("error fetching balance for user %s, token %s: %w",
-                                                u.Hex(), t.Symbol, err)
+                                        failedFetches <- FailedFetch{User: u, Token: t, Error: err}
                                         return
                                 }
 
                                 // Add to user snapshots for printing
-                                addToUserSnapshot(snapshot, t.Symbol)
+                                addToUserSnapshot(snapshot, t.Symbol, batchTimestamp)
 
                                 // Store the data in our batch map
                                 dataLock.Lock()
                                 userAddr := strings.ToLower(u.Hex())
-                                if batchData[userAddr] != nil {
-                                        batchData[userAddr].TokenData[t.Symbol] = [2]*big.Int{snapshot.MTokenBalance, snapshot.BorrowBalance}
+                                if batchData[userAddr] != nil && snapshot != nil {
+                                        if snapshot.MTokenBalance != nil && snapshot.BorrowBalance != nil {
+                                                batchData[userAddr].TokenData[t.Symbol] = [2]*big.Int{snapshot.MTokenBalance, snapshot.BorrowBalance}
+                                        } else {
+                                                failedFetches <- FailedFetch{User: u, Token: t, Error: fmt.Errorf("nil balance values")}
+                                        }
                                 }
                                 dataLock.Unlock()
                         }()
@@ -479,22 +555,40 @@ func processUserBatch(ctx context.Context, tokens []Token, users []common.Addres
 
         // Wait for all goroutines to complete
         wg.Wait()
-        close(errChan)
+        close(failedFetches)
 
-        // Check for errors
-        var errors []string
-        for err := range errChan {
-                errors = append(errors, err.Error())
+        // Collect failed fetches
+        var failures []FailedFetch
+        for failure := range failedFetches {
+                failures = append(failures, failure)
         }
 
-        if len(errors) > 0 {
-                for _, err := range errors {
-                        log.Printf("Warning: %v", err)
+        // Log failed fetches (these users will be skipped for this batch)
+        if len(failures) > 0 {
+                logError("Failed to fetch data for %d user-token pairs after retries:", len(failures))
+                for _, failure := range failures {
+                        logError("  User %s, Token %s: %v", failure.User.Hex(), failure.Token.Symbol, failure.Error)
+                        
+                        // Remove failed user-token data from batch (don't insert 0,0 values)
+                        dataLock.Lock()
+                        userAddr := strings.ToLower(failure.User.Hex())
+                        if batchData[userAddr] != nil {
+                                delete(batchData[userAddr].TokenData, failure.Token.Symbol)
+                        }
+                        dataLock.Unlock()
                 }
+                logError("These users will be processed in the next cycle")
         }
 
         // Now that we have all the data, insert the complete batch
-        log.Printf("All token data collected for %d users. Inserting complete batch...", len(users))
+        successfulUsers := 0
+        for _, snapshot := range batchData {
+                if len(snapshot.TokenData) > 0 {
+                        successfulUsers++
+                }
+        }
+        log.Printf("Token data collected for %d/%d users (skipped %d users with failed fetches). Inserting batch...", 
+                successfulUsers, len(users), len(users)-successfulUsers)
         if err := insertCompleteBatch(db, batchData, tokens); err != nil {
                 return fmt.Errorf("error inserting complete batch: %w", err)
         }
@@ -507,7 +601,7 @@ func processUserBatchInSubBatches(ctx context.Context, tokens []Token, users []c
         totalUsers := len(users)
 
         // Using the global subBatchSizes variable (five batches of 20 each by default)
-        log.Printf("Dividing batch of %d users into %d sub-batches of sizes: %v",
+        logInfo("Dividing batch of %d users into %d sub-batches of sizes: %v",
                 totalUsers, len(subBatchSizes), subBatchSizes)
 
         // Process sub-batches
@@ -526,7 +620,7 @@ func processUserBatchInSubBatches(ctx context.Context, tokens []Token, users []c
 
                 // Extract the sub-batch of users
                 subBatch := users[startIdx:endIdx]
-                log.Printf("Processing sub-batch %d/%d with %d users (users %d to %d)",
+                logInfo("Processing sub-batch %d/%d with %d users (users %d to %d)",
                         i+1, len(subBatchSizes), len(subBatch), startIdx, endIdx-1)
 
                 // Process this sub-batch
@@ -536,7 +630,7 @@ func processUserBatchInSubBatches(ctx context.Context, tokens []Token, users []c
 
                 // Add a delay between sub-batches to avoid rate limits
                 if i < len(subBatchSizes)-1 && endIdx < totalUsers {
-                        log.Printf("Waiting %s before processing next sub-batch", subBatchDelay)
+                        logInfo("Waiting %s before processing next sub-batch", subBatchDelay)
                         time.Sleep(subBatchDelay)
                 }
 
@@ -549,8 +643,18 @@ func processUserBatchInSubBatches(ctx context.Context, tokens []Token, users []c
 
 // insertCompleteBatch inserts a batch of users with their complete token data
 func insertCompleteBatch(db *sql.DB, batchData map[string]*BatchSnapshot, tokens []Token) error {
-        // Start a transaction
-        tx, err := db.Begin()
+        if db == nil {
+                return fmt.Errorf("database connection is nil")
+        }
+        if len(batchData) == 0 {
+                return nil // Nothing to insert
+        }
+        
+        // Start a transaction with context
+        ctx, cancel := context.WithTimeout(rootCtx, 60*time.Second)
+        defer cancel()
+        
+        tx, err := db.BeginTx(ctx, nil)
         if err != nil {
                 return fmt.Errorf("error starting transaction: %w", err)
         }
@@ -562,6 +666,10 @@ func insertCompleteBatch(db *sql.DB, batchData map[string]*BatchSnapshot, tokens
 
         // Add token columns to the SQL
         for i, token := range tokens {
+                // Validate each token symbol
+                if !isValidTokenSymbol(token.Symbol) {
+                        return fmt.Errorf("invalid token symbol in batch: %s", token.Symbol)
+                }
                 insertSQL += fmt.Sprintf(`, "%s"`, token.Symbol)
                 valueSQL += fmt.Sprintf(", $%d", i+3)
         }
@@ -574,8 +682,8 @@ func insertCompleteBatch(db *sql.DB, batchData map[string]*BatchSnapshot, tokens
 
         finalSQL := insertSQL + updateSQL
 
-        // Prepare statement
-        stmt, err := tx.Prepare(finalSQL)
+        // Prepare statement with context
+        stmt, err := tx.PrepareContext(ctx, finalSQL)
         if err != nil {
                 return fmt.Errorf("error preparing statement: %w", err)
         }
@@ -606,8 +714,8 @@ func insertCompleteBatch(db *sql.DB, batchData map[string]*BatchSnapshot, tokens
                         params[i+2] = val
                 }
 
-                // Execute insert/update
-                _, err := stmt.Exec(params...)
+                // Execute insert/update with context
+                _, err := stmt.ExecContext(ctx, params...)
                 if err != nil {
                         return fmt.Errorf("error inserting/updating user %s: %w", userAddr, err)
                 }
@@ -620,7 +728,7 @@ func insertCompleteBatch(db *sql.DB, batchData map[string]*BatchSnapshot, tokens
                 return fmt.Errorf("error committing transaction: %w", err)
         }
 
-        log.Printf("Successfully inserted/updated %d users with complete token data", successCount)
+        logInfo("Successfully inserted/updated %d users with complete token data", successCount)
         return nil
 }
 
@@ -640,7 +748,7 @@ func saveCheckpoint(index int) error {
                 return fmt.Errorf("failed to write checkpoint: %w", err)
         }
 
-        log.Printf("Checkpoint saved: last processed index %d", index)
+        logInfo("Checkpoint saved: last processed index %d", index)
         return nil
 }
 
@@ -648,7 +756,7 @@ func saveCheckpoint(index int) error {
 func loadCheckpoint() (int, error) {
         // Check if checkpoint file exists
         if _, err := os.Stat(checkpointFile); os.IsNotExist(err) {
-                log.Printf("No checkpoint found, starting from beginning")
+                logInfo("No checkpoint found, starting from beginning")
                 return 0, nil
         }
 
@@ -665,7 +773,7 @@ func loadCheckpoint() (int, error) {
                 return 0, fmt.Errorf("invalid checkpoint format: %w", err)
         }
 
-        log.Printf("Checkpoint loaded: resuming from index %d", index)
+        logInfo("Checkpoint loaded: resuming from index %d", index)
         return index, nil
 }
 
@@ -678,7 +786,7 @@ func takeSnapshot(ctx context.Context, tokens []Token, users []common.Address, d
         // Start from last processed index
         startIndex := lastProcessedIndex
         if startIndex >= totalUsers {
-                log.Printf("All users have been processed. Resetting to beginning.")
+                logInfo("All users have been processed. Resetting to beginning.")
                 startIndex = 0
                 lastProcessedIndex = 0
                 if err := saveCheckpoint(lastProcessedIndex); err != nil {
@@ -686,7 +794,7 @@ func takeSnapshot(ctx context.Context, tokens []Token, users []common.Address, d
                 }
         }
 
-        log.Printf("Starting from index %d of %d users", startIndex, totalUsers)
+        logInfo("Starting from index %d of %d users", startIndex, totalUsers)
 
         // Process users in batches
         for i := startIndex; i < len(users); i += batchSize {
@@ -697,7 +805,7 @@ func takeSnapshot(ctx context.Context, tokens []Token, users []common.Address, d
 
                 batchStartTime := time.Now()
                 batchUsers := users[i:end]
-                log.Printf("Processing batch of users %d to %d of %d (%.1f%% complete)",
+                logInfo("Processing batch of users %d to %d of %d (%.1f%% complete)",
                         i, end-1, totalUsers, float64(processed+i-startIndex)/float64(totalUsers)*100)
 
                 // Process the batch in smaller sub-batches to avoid rate limits
@@ -751,14 +859,64 @@ func takeSnapshot(ctx context.Context, tokens []Token, users []common.Address, d
         return nil
 }
 
+// cleanupInactiveUsers removes users from the database that are no longer in the active users list
+func cleanupInactiveUsers(activeUserAddresses []string) error {
+        if len(activeUserAddresses) == 0 {
+                log.Println("No active users found, skipping cleanup")
+                return nil
+        }
+
+        log.Printf("Cleaning up inactive users from database...")
+
+        // Create placeholders for the IN clause
+        placeholders := make([]string, len(activeUserAddresses))
+        for i := range activeUserAddresses {
+                placeholders[i] = fmt.Sprintf("$%d", i+1)
+        }
+
+        // Build the cleanup query
+        cleanupSQL := fmt.Sprintf(`
+                DELETE FROM public.moonwell_user_balances 
+                WHERE user_addr NOT IN (%s)
+        `, strings.Join(placeholders, ","))
+
+        // Convert strings to interface{} slice for query execution
+        args := make([]interface{}, len(activeUserAddresses))
+        for i, addr := range activeUserAddresses {
+                args[i] = strings.ToLower(addr) // Ensure consistent case
+        }
+
+        // Execute cleanup
+        ctx, cancel := context.WithTimeout(rootCtx, 30*time.Second)
+        defer cancel()
+
+        result, err := db.ExecContext(ctx, cleanupSQL, args...)
+        if err != nil {
+                return fmt.Errorf("error cleaning up inactive users: %w", err)
+        }
+
+        // Get the number of rows affected
+        rowsAffected, err := result.RowsAffected()
+        if err != nil {
+                log.Printf("Warning: Could not get rows affected count: %v", err)
+        } else {
+                log.Printf("Cleanup completed: removed %d inactive users from database", rowsAffected)
+        }
+
+        return nil
+}
+
 // updateUsersFromSupabase updates the users.txt file with active users from the same database
 func updateUsersFromSupabase() error {
         log.Println("=== Starting User List Update ===")
+        
+        // Create active users table
         _, err := db.Exec(createActiveUsersSQL)
         if err != nil {
                 log.Printf("Error creating active_users table: %v", err)
                 return err
         }
+        
         log.Println("Fetching active user addresses...")
         rows, err := db.Query(getUserAddressesSQL)
         if err != nil {
@@ -767,6 +925,7 @@ func updateUsersFromSupabase() error {
                 return err
         }
         defer rows.Close()
+        
         var addresses []string
         for rows.Next() {
                 var address string
@@ -782,39 +941,51 @@ func updateUsersFromSupabase() error {
                         log.Printf("Warning: Skipping invalid address: %s", address)
                 }
         }
+        
         if err := rows.Err(); err != nil {
                 log.Printf("Error reading addresses: %v", err)
                 log.Println("Will continue with existing addresses in users.txt")
                 return err
         }
+        
         log.Printf("Retrieved %d active user addresses", len(addresses))
+        
+        // Clean up inactive users from the database before updating users.txt
+        if err := cleanupInactiveUsers(addresses); err != nil {
+                log.Printf("Warning: Failed to cleanup inactive users: %v", err)
+                // Continue despite cleanup failure
+        }
+        
+        // Update users.txt with active addresses
         content := strings.Join(addresses, "\n")
         if len(addresses) > 0 {
                 content += "\n"
         }
+        
         if err := os.WriteFile("data/users.txt", []byte(content), 0644); err != nil {
                 log.Printf("Error writing users.txt: %v", err)
                 log.Println("Will continue with existing addresses in users.txt")
                 return err
         }
+        
         log.Printf("users.txt updated with %d addresses", len(addresses))
-        log.Println("Truncating moonwell_user_balances table...")
-        if _, err := db.Exec(truncateBalancesSQL); err != nil {
-                log.Printf("Error truncating moonwell_user_balances: %v", err)
-        }
+        
         log.Println("Resetting checkpoint to 0...")
         if err := os.WriteFile(checkpointFile, []byte("0"), 0644); err != nil {
                 log.Printf("Error resetting checkpoint: %v", err)
         }
+        
         // Set lastProcessedIndex to 0 in memory as well
         lastProcessedIndex = 0
+        
         log.Println("User update completed successfully")
         return nil
 }
 
 func main() {
         // Connect to Ethereum node
-        client, err := ethclient.Dial(ethRPC)
+        var err error
+        client, err = ethclient.Dial(ethRPC)
         if err != nil {
                 log.Fatalf("Failed to connect to Ethereum node: %v", err)
         }
@@ -836,7 +1007,7 @@ func main() {
         db.SetMaxIdleConns(5)
         db.SetConnMaxLifetime(5 * time.Minute)
 
-        // Try to ping the database with timeout
+        // Create initial context for database ping before rootCtx is created
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
 
@@ -872,8 +1043,18 @@ func main() {
                 lastProcessedIndex = index
         }
 
-        // Create context
-        ctx = context.Background()
+        // Create context with cancellation
+        rootCtx, cancelFunc = context.WithCancel(context.Background())
+        defer cancelFunc()
+
+        // Set up signal handling for graceful shutdown
+        sigChan := make(chan os.Signal, 1)
+        signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+        go func() {
+                <-sigChan
+                log.Println("Received shutdown signal, gracefully stopping...")
+                cancelFunc()
+        }()
 
         // Try to update users before initial snapshot
         log.Println("Attempting to update user list before initial snapshot...")
@@ -900,7 +1081,11 @@ func main() {
         log.Printf("Starting snapshot of %d users with %d tokens...", len(users), len(tokens))
         startTime := time.Now()
 
-        if err := takeSnapshot(ctx, tokens, users, db); err != nil {
+        if err := takeSnapshot(rootCtx, tokens, users, db); err != nil {
+                if rootCtx.Err() == context.Canceled {
+                        log.Println("Snapshot canceled due to shutdown")
+                        return
+                }
                 log.Fatalf("Failed to take snapshot: %v", err)
         }
 
@@ -913,7 +1098,12 @@ func main() {
         log.Printf("Waiting %s until next snapshot", snapshotInterval)
 
         // Main loop runs every snapshotInterval
-        for range ticker.C {
+        for {
+                select {
+                case <-rootCtx.Done():
+                        log.Println("Shutting down main loop...")
+                        return
+                case <-ticker.C:
                 startTime := time.Now()
                 log.Printf("Starting periodic snapshot...")
 
@@ -943,13 +1133,18 @@ func main() {
                         lastProcessedIndex = index
                 }
 
-                if err := takeSnapshot(ctx, tokens, users, db); err != nil {
+                if err := takeSnapshot(rootCtx, tokens, users, db); err != nil {
+                        if rootCtx.Err() == context.Canceled {
+                                log.Println("Snapshot canceled due to shutdown")
+                                return
+                        }
                         log.Printf("Failed to take snapshot: %v", err)
                 } else {
                         log.Printf("Periodic snapshot completed in %s", time.Since(startTime).Round(time.Second))
                 }
 
                 log.Printf("Waiting %s until next snapshot", snapshotInterval)
+                }
         }
 }
 

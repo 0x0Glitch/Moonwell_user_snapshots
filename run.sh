@@ -7,13 +7,13 @@ export SKIP_DATABASE="false"
 
 # Default configuration - adjust as needed
 WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-10}
-BATCH_SIZE=${BATCH_SIZE:-100}
-FETCH_INTERVAL_HOURS=${FETCH_INTERVAL_HOURS:-2}
+BATCH_SIZE=${BATCH_SIZE:-50}
+FETCH_INTERVAL_HOURS=${FETCH_INTERVAL_HOURS:-4}
 USE_MULTICALL=${USE_MULTICALL:-true}
 
 # Set default environment variables if not already set
-export RPC_URL=${RPC_URL:-"https://your-ethereum-rpc-url"}
-export PG_DSN=${PG_DSN:-"postgresql://username:password@hostname:port/database"}
+export RPC_URL=${RPC_URL:-"https://base-mainnet.blastapi.io/eb546001-af94-4a0f-ae06-7f24c1cd7023"}
+export PG_DSN=${PG_DSN:-"postgresql://postgres.womnwtxrzdgjnzzauygx:anshuman@aws-1-us-east-2.pooler.supabase.com:6543/postgres"}
 
 # Check if RPC_URL is set
 if [ -z "$RPC_URL" ]; then
